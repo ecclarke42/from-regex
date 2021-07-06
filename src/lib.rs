@@ -2,7 +2,8 @@ extern crate from_regex_macros;
 pub use from_regex_macros::*;
 pub use lazy_static::lazy_static;
 
-pub use regex::Regex;
+pub use regex;
+pub use regex::{Captures, Regex};
 pub use std::str::FromStr;
 
 pub trait FromRegex: Sized {
