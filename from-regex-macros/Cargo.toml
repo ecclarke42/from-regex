@@ -1,5 +1,6 @@
 [package]
 name = "from-regex-macros"
+description = "Macros for the from-regex crate"
 version = "0.1.0"
 edition = "2018"
 
