@@ -1,13 +1,19 @@
 [package]
 name = "from-regex"
+description = "Derive deserialization of structs and enums from regex patterns"
 version = "0.1.0"
 edition = "2018"
 
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+authors = ["Elliott Clarke <ecclarke42@gmail.com>"]
+documentation = "https://docs.rs/from-regex"
+repository = "https://github.com/ecclarke42/from-regex"
+license = "MIT"
+readme = "README.md"
+keywords = ["regex", "derive"]
+categories = ["parsing", "text-processing"]
 
 [dependencies]
-from-regex-macros = { path = "./from-regex-macros" }
-
+from-regex-macros = "0.1.0"
 regex = "*"
 lazy_static = "*"
 
