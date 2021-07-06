@@ -3,6 +3,15 @@ name = "from-regex-macros"
 version = "0.1.0"
 edition = "2018"
 
+authors = ["Elliott Clarke <ecclarke42@gmail.com>"]
+documentation = "https://docs.rs/from-regex-macros"
+readme = "README.md"
+repository = "https://github.com/ecclarke42/from-regex"
+license = "MIT"
+
+keywords = ["regex", "derive"]
+categories = ["parsing", "text-processing"]
+
 [lib]
 proc-macro = true
 
