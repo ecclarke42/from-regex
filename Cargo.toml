@@ -14,8 +14,8 @@ categories = ["parsing", "text-processing"]
 
 [dependencies]
 from-regex-macros = "0.1.0"
-regex = "*"
-lazy_static = "*"
+regex = "1"
+lazy_static = "1"
 
 [workspace]
 members = [
