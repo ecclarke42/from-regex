@@ -2,14 +2,32 @@ extern crate from_regex_macros;
 pub use from_regex_macros::*;
 pub use lazy_static::lazy_static;
 
-pub use regex;
-pub use regex::{Captures, Regex};
+pub use rangemap::{self, RangeMap};
+pub use regex::{self, Captures, Regex};
 pub use std::str::FromStr;
 
+// TODO: String vs &str in capture fields
+// TODO: only need clone for search. And not really even for that
+
+/// Try to construct an instance of this type from a string
 pub trait FromRegex: Sized {
-    type CustomError;
-    fn from_regex(s: &str) -> Result<Self, FromRegexError<Self::CustomError>>;
+    /// Try to construct an instance of this type from a string
+    fn from_regex(s: &str) -> Option<Self>;
+
+    /// Search through a string and return all instances of this type matched
+    fn matches(s: &str) -> Vec<Self> {
+        Self::match_locations(s)
+            .into_iter()
+            .map(|(_, v)| v)
+            .collect()
+    }
+
+    /// Search through a string and return all instances of this type matched,
+    /// As well as the ranges at which they occur.
+    fn match_locations(s: &str) -> RangeMap<usize, Self>;
 }
+
+// TODO: Search trait? to split matches/match_locations out...
 
 // #[cfg(feature = "from_str")]
 // impl<T: FromRegex> std::str::FromStr for T {
@@ -19,158 +37,74 @@ pub trait FromRegex: Sized {
 //     }
 // }
 
-#[derive(Debug)]
-pub enum FromRegexError<Err> {
-    NoMatch,
-    Custom(Err),
+pub trait TextMap<V> {
+    fn merge_only_longest<I: IntoIterator<Item = (rangemap::Range<usize>, V)>>(&mut self, other: I);
 }
 
-impl<Err> std::fmt::Display for FromRegexError<Err>
-where
-    Err: std::fmt::Display,
-{
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::NoMatch => write!(f, "No match found"),
-            Self::Custom(err) => write!(f, "Custom: {}", err),
+impl<V: Clone + Eq> TextMap<V> for RangeMap<usize, V> {
+    fn merge_only_longest<I: IntoIterator<Item = (rangemap::Range<usize>, V)>>(
+        &mut self,
+        other: I,
+    ) {
+        for (range, value) in other {
+            // Check the easy case (insert into an empty space)
+            if let Some(value) = self.insert_if_empty(range, value) {
+                // Check using start and end (if we're keeping whichever is longer,
+                // one of them must be overlapped by a longer segment)
+                let to_remove =
+                    if let (Some(start), Some(end)) = (range.start_value(), range.end_value()) {
+                        let len = end - start;
+
+                        // Check if this range is larger than the overlapping range preceeding it
+                        let before = self.get_range_value(start).map(|(r, _)| r);
+                        let larger_than_before = if let Some(before) = before {
+                            before
+                                .start_value()
+                                .zip(before.end_value())
+                                .map(|(a, b)| len > (b - a))
+                                .unwrap_or_default()
+                        } else {
+                            // If no range before, treat this as larger (i.e. insert it)
+                            true
+                        };
+
+                        // Likewise for the range after
+                        let after = self.get_range_value(end).map(|(r, _)| r);
+                        let larger_than_after = if let Some(after) = after {
+                            after
+                                .start_value()
+                                .zip(after.end_value())
+                                .map(|(a, b)| len > (b - a))
+                                .unwrap_or_default()
+                        } else {
+                            true
+                        };
+
+                        // Return cloned ranges so they aren't borrowed
+                        if larger_than_before && larger_than_after {
+                            Some((before.cloned(), after.cloned()))
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    };
+
+                if let Some((before, after)) = to_remove {
+                    if let Some(before) = before {
+                        self.clear_range(before);
+                    }
+                    if let Some(after) = after {
+                        self.clear_range(after);
+                    }
+
+                    // Add the current range (and overwrite any ranges it fully encompasses)
+                    self.set(range, value);
+                }
+            }
         }
     }
 }
 
-impl<Err> std::error::Error for FromRegexError<Err> where Err: std::error::Error {}
-
-// TODO: more error things?
-// pub enum Test {
-//     A,
-//     B,
-// }
-
-// lazy_static! {
-//     static ref A_REGEX: Regex = Regex::new("a").unwrap();
-//     static ref B_REGEX: Regex = Regex::new("b").unwrap();
-// }
-// impl Test {
-//     fn from_a_capture(cap: regex::Captures) -> Option<Self> {
-//         todo!()
-//     }
-//     // fn from_regex_as_a(s: &str) -> Option<Self> {
-//     //     A_REGEX.captures(s).map(Self::from_a_capture).flatten()
-//     // }
-//     fn from_regex_as_a_exact(s: &str) -> Option<Self> {
-//         match A_REGEX.captures(s) {
-//             Some(cap) => {
-//                 if cap[0].len() == s.len() {
-//                     Self::from_a_capture(cap)
-//                 } else {
-//                     None
-//                 }
-//             }
-//             None => None,
-//         }
-//     }
-
-//     fn regex_capture_a_consuming(s: &mut String) -> Vec<Self> {
-//         let mut offset = 0;
-//         let (ranges, values) = A_REGEX
-//             .captures_iter(&s)
-//             .filter_map(|cap| {
-//                 let range = cap.get(0).unwrap().range(); // Unwrap should be fine, since otherwise it wouldn't match
-//                 let value = Self::from_a_capture(cap);
-//                 value.map(|v| (range, v))
-//             })
-//             .unzip::<_, _, Vec<_>, Vec<_>>();
-
-//         // Remove these ranges from the string
-//         for mut range in ranges {
-//             range.start -= offset;
-//             range.end -= offset;
-//             offset += range.len();
-//             s.replace_range(range, "");
-//         }
-
-//         values
-//     }
-//     fn regex_capture_unit(s: &mut String) -> Vec<Self> {
-//         let mut offset = 0;
-//         let (ranges, values) = A_REGEX
-//             .find_iter(&s)
-//             .map(|mat| (mat.range(), Self::A))
-//             .unzip::<_, _, Vec<_>, Vec<_>>();
-
-//         // Remove these ranges from the string
-//         for mut range in ranges {
-//             range.start -= offset;
-//             range.end -= offset;
-//             offset += range.len();
-//             s.replace_range(range, "");
-//         }
-
-//         values
-//     }
-
-//     pub fn from_regex(s: &str) -> Result<Self, ()> {
-//         if let Some(variant) = Self::from_regex_as_a_exact(s) {
-//             return Ok(variant);
-//         }
-
-//         Err(())
-//     }
-
-//     // TODO: remove?
-//     pub fn regex(&self) -> &Regex {
-//         match self {
-//             Self::A => &A_REGEX,
-//             Self::B => &B_REGEX,
-//         }
-//     }
-
-//     /// Note: this will allocate a new string from `s`, which will be consumed as items are consumed
-//     ///
-//     /// TODO: enum variant only
-//     /// todo: indices?
-//     pub fn search(s: &str) -> Vec<Self> {
-//         let mut s = s.to_string();
-//         let mut out = Vec::new();
-//         out.append(&mut Self::regex_capture_a_consuming(&mut s));
-
-//         out
-//     }
-// }
-// fn test() {
-//     let r1 = regex::Regex::new(r"NAS(?P<_0>[0-9][A-z0-9-]*)").unwrap();
-//     let r2 = regex::Regex::new(r"AS(?P<_0>[0-9][A-z0-9-]*)").unwrap();
-
-//     let mut text =String::from("Let's talk about NAS1805, NAS1057W4A-028 and S501654321-01. Make sure to also include AS4824N04");
-
-//     let mut offset = 0;
-//     for mut range in r1
-//         .captures_iter(&text)
-//         .map(|cap| {
-//             println!("r1: {:?}", cap);
-//             cap.get(0).unwrap().range()
-//         })
-//         .collect::<Vec<_>>()
-//     {
-//         range.start -= offset;
-//         range.end -= offset;
-//         offset += range.len();
-//         text.replace_range(range, "");
-//     }
-
-//     offset = 0;
-//     for mut range in r2
-//         .captures_iter(&text)
-//         .map(|cap| {
-//             println!("r2: {:?}", cap);
-//             cap.get(0).unwrap().range()
-//         })
-//         .collect::<Vec<_>>()
-//     {
-//         range.start -= offset;
-//         range.end -= offset;
-//         offset += range.len();
-//         text.replace_range(range, "");
-//     }
-
-//     println!("unmatched: \"{}\"", text)
-// }
+#[cfg(test)]
+mod tests;

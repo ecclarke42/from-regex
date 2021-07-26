@@ -1,6 +1,13 @@
+use std::collections::HashMap;
+
 use heck::{ShoutySnekCase, SnekCase};
+use proc_macro_error::abort;
 use quote::quote;
 use syn::spanned::Spanned;
+
+use crate::captures;
+
+// TODO: make sure variants match full text
 
 pub struct Item<'a> {
     ident: &'a syn::Ident,
@@ -8,10 +15,57 @@ pub struct Item<'a> {
     variants: Vec<Variant<'a>>,
 }
 
-pub struct ItemAttributes;
+pub struct ItemAttributes {
+    match_mode: MatchMode,
+}
+// TODO: document match mode... First generates multiple regex consts,
+// longest only generates a master regex for the whole enum
+enum MatchMode {
+    First,
+    Longest,
+}
+
+// Regex default or (a)|(b) is to match the longest variant
+impl Default for MatchMode {
+    fn default() -> Self {
+        Self::Longest
+    }
+}
+
+const ENUM_ATTRIBUTE_MATCH_MODE: &str = "match_mode";
+const ENUM_ATTRIBUTE_MATCH_MODE_LONGEST: &str = "longest";
+const ENUM_ATTRIBUTE_MATCH_MODE_FIRST: &str = "first";
+
 impl From<&[syn::Attribute]> for ItemAttributes {
-    fn from(_: &[syn::Attribute]) -> Self {
-        Self
+    fn from(attrs: &[syn::Attribute]) -> Self {
+        let mut match_mode = MatchMode::Longest;
+        for meta in crate::Attributes::from(attrs) {
+            if let syn::NestedMeta::Meta(syn::Meta::NameValue(syn::MetaNameValue {
+                path,
+                lit: syn::Lit::Str(lit),
+                ..
+            })) = meta
+            {
+                if path.is_ident(ENUM_ATTRIBUTE_MATCH_MODE) {
+                    match lit.value().as_str() {
+                        ENUM_ATTRIBUTE_MATCH_MODE_LONGEST => match_mode = MatchMode::Longest,
+                        ENUM_ATTRIBUTE_MATCH_MODE_FIRST => match_mode = MatchMode::First,
+                        other => abort!(lit.span(), "Unknown match mode: {}", other),
+                    }
+                }
+            }
+        }
+
+        Self { match_mode }
+    }
+}
+
+impl<'a> quote::ToTokens for Item<'a> {
+    fn to_tokens(&self, tokens: &mut proc_macro2::TokenStream) {
+        tokens.extend(match self.attrs.match_mode {
+            MatchMode::Longest => self.to_tokens_longest(),
+            MatchMode::First => self.to_tokens_first(),
+        })
     }
 }
 
@@ -28,89 +82,337 @@ impl<'a> Item<'a> {
         }
     }
 
-    pub fn impl_from_regex(&self) -> proc_macro2::TokenStream {
-        let ident = self.ident;
-        let enum_name_shouty = self.ident.to_string().TO_SHOUTY_SNEK_CASE();
+    fn name_shouty(&self) -> String {
+        self.ident.to_string().TO_SHOUTY_SNEK_CASE()
+    }
 
-        // Because these are annoying to unzip a bunch of times
-        let mut regex_defs = Vec::new();
-        let mut from_capture_fn_idents = Vec::new();
-        let mut from_capture_impls = Vec::new();
-        let mut from_regex_as_fn_idents = Vec::new();
-        let mut from_regex_as_impls = Vec::new();
-        let mut regex_capture_consuming_fn_idents = Vec::new();
-        let mut regex_capture_consuming_impls = Vec::new();
-
-        let mut default_variant = None;
+    /// Get the constructor for the default variant (if it exists)
+    fn default_constructor(&self) -> Option<proc_macro2::TokenStream> {
+        let mut default = None;
         for variant in self.variants.iter() {
             if variant.attrs.default {
-                // TODO: Parse type here?
-                if default_variant.is_some() {
-                    panic!("More than one default varaiant");
+                if let Some((existing, _)) = default {
+                    abort!(variant.ident.span(), "More than one default varaiant. {} identified as default, but {} is already set", variant.ident, existing);
                 }
-                default_variant = Some(variant);
+
+                let ident = self.ident;
+                let variant_ident = variant.ident;
+
+                default = Some((
+                    variant_ident,
+                    match &variant.fields {
+                        syn::Fields::Named(syn::FieldsNamed { named, .. }) => {
+                            let fields = named
+                                .iter()
+                                .map(|syn::Field { ident, ty, .. }| {
+                                    quote! { #ident: <#ty>::default() }
+                                })
+                                .collect::<Vec<_>>();
+                            quote! { Some(#ident::#variant_ident { #( #fields, )* }) }
+                        }
+
+                        syn::Fields::Unnamed(syn::FieldsUnnamed { unnamed, .. }) => {
+                            let fields = unnamed
+                                .iter()
+                                .map(|syn::Field { ty, .. }| {
+                                    quote! { <#ty>::default() }
+                                })
+                                .collect::<Vec<_>>();
+
+                            quote! { Some(#ident::#variant_ident ( #( #fields, )* )) }
+                        }
+
+                        syn::Fields::Unit => quote! { Some(#ident::#variant_ident) },
+                    },
+                ))
             }
+        }
+        default.map(|(_, stream)| stream)
+    }
 
-            if let Some(pattern) = &variant.attrs.pattern {
-                let pattern = pattern.value();
-                let capture_groups = crate::captures::from_regex_pattern(&pattern);
-                let regex_const = syn::Ident::new(
-                    &format!(
-                        "{}_{}_REGEX",
-                        enum_name_shouty,
-                        variant.ident.to_string().TO_SHOUTY_SNEK_CASE()
-                    ),
-                    self.ident.span(),
-                );
+    /// [`ToTokens`] for [`MatchMode::Longest`] with combined regex
+    /// (no transparent items)
+    ///
+    /// TODO: combine below to generalized func
+    ///
+    /// Generate a definition statement for the combined regex.
+    /// Returns a mapping of variant names to capture groups (with updated
+    /// captures) and the token stream defining the regex constant.
+    ///
+    /// Capture groups in each variant will be prepended with the variant and
+    /// wrapped with a varaiant-specific capture group.
+    ///
+    /// For example:
+    /// ```ignore
+    /// enum Test {
+    ///     #[from_regex(pattern = "(?P<one>[0-9]{5})-(?P<two>[a-z]*)?")]
+    ///     VariantA {
+    ///         one: String,
+    ///         two: Option<String>,
+    ///     }
+    ///     #[from_regex(pattern = "some(?P<0>thing)")]
+    ///     VariantB(String),
+    ///     #[from_regex(default)]
+    ///     C,
+    /// }
+    /// ```
+    /// Generates
+    /// ```ignore
+    /// lazy_static! {
+    ///     static ref TEST_REGEX: Regex = Regex::new("(?P<VariantA>(?P<VariantA_one>[0-9]{5})-(?P<VariantA_two>[a-z]*)?)|(?P<VariantB>some(?P<VariantB_0>thing))")
+    /// }
+    /// ```
+    fn to_tokens_longest(&self) -> proc_macro2::TokenStream {
+        // Combine regex patterns we have into one single pattern
+        let ident = self.ident;
+        let regex_ident = syn::Ident::new(&format!("{}_REGEX", self.name_shouty()), ident.span());
 
-                regex_defs.push(quote! {
-                    static ref #regex_const: from_regex::Regex = from_regex::Regex::new(#pattern).expect("Failed to compile regex");
-                });
+        let mut patterns = Vec::new();
+        let mut from_capture_impls = Vec::new();
+        let mut from_regex_impls = Vec::new();
 
-                let (ident, implementation) = 
-                    variant.impl_from_capture(capture_groups);
-                from_capture_fn_idents.push(ident);
-                from_capture_impls.push(implementation);
+        let mut match_locations_patterened = Vec::new();
+        let mut match_locations_transparent = Vec::new();
 
-                let (ident, implementation) = 
-                    variant.impl_from_regex_as_exact(&regex_const);
-                from_regex_as_fn_idents.push(ident);
-                from_regex_as_impls.push(implementation);
+        for variant in self.variants.iter() {
+            let ident = variant.ident;
+            let ident_str = ident.to_string();
 
-                let (ident, implementation) = 
-                    variant.impl_capture_consuming(&regex_const);
-                regex_capture_consuming_fn_idents.push(ident);
-                regex_capture_consuming_impls.push(implementation);
+            // If a patterned variant, collect it's
+            match &variant.attrs.pattern {
+                VariantPattern::Some(pattern_lit) => {
+                    let mut pattern = pattern_lit.value();
+
+                    // Get group / field pairs
+                    let groups = captures::from_regex_pattern(&pattern.clone())
+                        .into_iter()
+                        .map(|(group, optional)| {
+                            // Prepend group name with variant name
+                            let new_group = if group.starts_with('_') {
+                                format!("{}{}", ident_str, group)
+                            } else {
+                                format!("{}_{}", ident_str, group)
+                            };
+
+                            pattern = pattern
+                                .replace(&format!("?P<{}>", group), &format!("?P<{}>", new_group));
+
+                            (new_group, optional)
+                        })
+                        .collect::<HashMap<_, _>>();
+
+                    // For borrow
+                    let captured_groups = groups.iter().map(|(s, b)| (s.as_str(), *b)).collect();
+
+                    // Collect variant patterns
+                    let ident_str_lit = syn::LitStr::new(&ident_str, ident.span());
+                    patterns.push(format!("(?P<{}>{})", ident_str, pattern));
+
+                    // Generate a variant specific `__from_regex_capture_x` (will unwrap unless transparent)
+                    let (from_capture_fn, from_capture_impl) =
+                        variant.impl_from_capture(&captured_groups, true);
+
+                    from_capture_impls.push(from_capture_impl);
+                    from_regex_impls.push(quote! {
+                        if let Some(cap) = &captures {
+                            if cap.name(#ident_str_lit).is_some() {
+                                if let Some(value) = Self::#from_capture_fn(&cap) {
+                                    return Some(value);
+                                }
+                            }
+                        }
+                    });
+
+                    match_locations_patterened.push(quote! {
+                        if cap.name(#ident_str_lit).is_some() {
+                            if let Some(value) = Self::#from_capture_fn(&cap) {
+                                ranges.insert_if_empty(range, value);
+                                continue;
+                            }
+                        }
+                    });
+                }
+
+                VariantPattern::Transparent => {
+                    let inner = variant.transparent_inner_type().unwrap();
+                    from_regex_impls.push(quote! {
+                        if let Some(inner) = <#inner>::from_regex(s) {
+                            return Some(Self::#ident(inner));
+                        }
+                    });
+
+                    // If we have transparent items to search for, use their search
+                    // functions to generate sibling `RangeMap`s and use our extension
+                    // trait to keep segments longer than already found
+                    match_locations_transparent.push(quote! {
+                        ranges.merge_only_longest(
+                            <#inner>::match_locations(s).into_iter().map(|(r, v)| {
+                                (r, Self::#ident(v))
+                            })
+                        );
+                    });
+                }
+
+                VariantPattern::None => { /* No Op, since we'll never return these from regex */ }
+            }
+        }
+        let combined_pattern = patterns.join("|");
+
+        // Default return for from_regex
+        let return_from_regex = self
+            .default_constructor()
+            .unwrap_or_else(|| quote! { None });
+
+        quote! {
+            from_regex::lazy_static! {
+                static ref #regex_ident: from_regex::Regex = from_regex::Regex::new(#combined_pattern).expect("Failed to compile regex");
+            }
+            impl #ident {
+                #(
+                    #from_capture_impls
+                )*
+            }
+            impl from_regex::FromRegex for #ident {
+                fn from_regex(s: &str) -> Option<Self> {
+                    let captures = #regex_ident.captures(s).filter(|cap| cap[0].len() == s.len());
+                    #(
+                        #from_regex_impls
+                    )*
+                    #return_from_regex
+                }
+
+                fn match_locations(s: &str) -> from_regex::RangeMap<usize, Self> {
+                    use from_regex::TextMap;
+                    let mut ranges = from_regex::RangeMap::new();
+                    for cap in #regex_ident.captures_iter(s) {
+                        let range = cap.get(0).unwrap().range();
+                        #(
+                            #match_locations_patterened
+                        )*
+                    }
+
+                    #(
+                        #match_locations_transparent
+                    )*
+
+                    ranges
+                }
+            }
+        }
+    }
+
+    /// [`ToTokens`] for [`MatchMode::First`] (always separated regex)
+    ///
+    ///
+    fn to_tokens_first(&self) -> proc_macro2::TokenStream {
+        let ident = self.ident;
+
+        let enum_name_shouty = self.name_shouty();
+
+        let mut regex_defs = Vec::new();
+        let mut from_capture_impls = Vec::new();
+        let mut from_regex_impls = Vec::new();
+        let mut match_locations_impls = Vec::new();
+
+        for variant in self.variants.iter() {
+            let ident = variant.ident;
+
+            // If a patterned variant, collect it's
+            match &variant.attrs.pattern {
+                VariantPattern::Some(pattern_lit) => {
+                    let pattern = pattern_lit.value();
+
+                    let regex_ident = syn::Ident::new(
+                        &format!(
+                            "{}_{}_REGEX",
+                            enum_name_shouty,
+                            variant.ident.to_string().TO_SHOUTY_SNEK_CASE()
+                        ),
+                        self.ident.span(),
+                    );
+
+                    // Generate a regex constant for this variant only
+                    regex_defs.push(quote! {
+                        static ref #regex_ident: from_regex::Regex = from_regex::Regex::new(#pattern).expect("Failed to compile regex");
+                    });
+
+                    // Generate a variant specific `__from_regex_capture_x`
+                    // (will unwrap unless transparent)
+                    let (from_capture_fn, from_capture_impl) =
+                        variant.impl_from_capture(&captures::from_regex_pattern(&pattern), false);
+                    from_capture_impls.push(from_capture_impl);
+
+                    // Add a section for `from_regex` calling this variant's
+                    // conversion method
+                    from_regex_impls.push(quote! {                    
+                        if let Some(captures) = #regex_ident.captures(s).filter(|cap| cap[0].len() == s.len()) {
+                            if let Some(value) = Self::#from_capture_fn(&captures) {
+                                return Some(value);
+                            }
+                        }
+                    });
+
+                    match_locations_impls.push(quote! {
+                        for cap in #regex_ident.captures_iter(s) {
+                            if let Some(value) = Self::#from_capture_fn(&cap) {
+                                ranges.insert_if_empty(cap.get(0).unwrap().range(), value);
+                            }
+                        }
+                    });
+                }
+
+                VariantPattern::Transparent => {
+                    let inner = variant.transparent_inner_type().unwrap();
+                    from_regex_impls.push(quote! {
+                        if let Some(inner) = <#inner>::from_regex(s) {
+                            return Some(Self::#ident(inner));
+                        }
+                    });
+
+                    match_locations_impls.push(quote! {
+                        for (range, value) in <#inner>::match_locations(s) {
+                            ranges.insert_if_empty(range, Self::#ident(value));
+                        }
+                    });
+                }
+
+                VariantPattern::None => { /* No Op, since we'll never return these from regex */ }
             }
         }
 
-        // TODO: improve search to include ranges as well
+        // Default return for from_regex
+        let return_from_regex = self
+            .default_constructor()
+            .unwrap_or_else(|| quote! { None });
+
         quote! {
             from_regex::lazy_static! {
-                #(#regex_defs)*
+                #(
+                    #regex_defs
+                )*
             }
             impl #ident {
-                #(#from_capture_impls)*
-                #(#from_regex_as_impls)*
-                #(#regex_capture_consuming_impls)*
-
-                pub fn from_regex(s: &str) -> Option<Self> {
+                #(
+                    #from_capture_impls
+                )*
+            }
+            impl from_regex::FromRegex for #ident {
+                fn from_regex(s: &str) -> Option<Self> {
                     #(
-                        if let Some(variant) = Self::#from_regex_as_fn_idents(s) {
-                            return Some(variant);
-                        }
+                        #from_regex_impls
                     )*
-                    None
+                    #return_from_regex
                 }
 
-                /// Note: this will allocate a new string from `s`, which will be consumed as items are consumed
-                pub fn search(s: &str) -> Vec<Self> {
-                    let mut s = s.to_string();
-                    let mut out = Vec::new();
+                fn match_locations(s: &str) -> from_regex::RangeMap<usize, Self> {
+                    use from_regex::TextMap;
+                    let mut ranges = from_regex::RangeMap::new();
+
                     #(
-                        out.append(&mut Self::#regex_capture_consuming_fn_idents(&mut s));
+                        #match_locations_impls
                     )*
-                    out
+
+                    ranges
                 }
             }
         }
@@ -124,19 +426,33 @@ pub struct Variant<'a> {
 }
 
 pub struct VariantAttributes {
-    pattern: Option<syn::LitStr>,
+    pattern: VariantPattern,
     default: bool,
 }
+impl VariantAttributes {
+    fn is_transparent(&self) -> bool {
+        matches!(self.pattern, VariantPattern::Transparent)
+    }
+}
+
+enum VariantPattern {
+    None,
+    Some(syn::LitStr),
+    Transparent,
+}
+
 const VARIANT_ATTRIBUTE_PATTERN: &str = "pattern";
 const VARIANT_ATTRIBUTE_DEFAULT: &str = "default";
+const VARIANT_ATTRIBUTE_TRANSPARENT: &str = "transparent";
 
 impl<'a> From<&'a [syn::Attribute]> for VariantAttributes {
     fn from(attrs: &'a [syn::Attribute]) -> Self {
-        let mut pattern = None;
+        let mut pattern = VariantPattern::None;
         let mut default = false;
         for attr in attrs {
             if let syn::Meta::List(list) = attr.parse_meta().expect("failed to parse attr meta") {
                 if list.path.is_ident(crate::ATTRIBUTE) {
+                    let attr_span = list.span();
                     for nested in list.nested {
                         if let syn::NestedMeta::Meta(meta) = nested {
                             match meta {
@@ -146,12 +462,22 @@ impl<'a> From<&'a [syn::Attribute]> for VariantAttributes {
                                     ..
                                 }) => {
                                     if path.is_ident(VARIANT_ATTRIBUTE_PATTERN) {
-                                        pattern = Some(lit);
+                                        match pattern {
+                                            VariantPattern::None => pattern = VariantPattern::Some(lit),
+                                            VariantPattern::Some(_) => abort!(attr_span, "Pattern already defined on this variant"),
+                                            VariantPattern::Transparent => abort!(attr_span, "Variants can only have a pattern or be transparent (not both)"),
+                                        }
                                     }
                                 }
                                 syn::Meta::Path(path) => {
                                     if path.is_ident(VARIANT_ATTRIBUTE_DEFAULT) {
                                         default = true;
+                                    } else if path.is_ident(VARIANT_ATTRIBUTE_TRANSPARENT) {
+                                        match pattern {
+                                            VariantPattern::None => pattern = VariantPattern::Transparent,
+                                            VariantPattern::Some(_) => abort!(attr_span, "Pattern already defined on this variant"),
+                                            VariantPattern::Transparent => abort!(attr_span, "Variants can only have a pattern or be transparent (not both)"),
+                                        }
                                     }
                                 }
                                 _ => {}
@@ -162,181 +488,110 @@ impl<'a> From<&'a [syn::Attribute]> for VariantAttributes {
             }
         }
 
-        Self {
-            pattern,
-            default,
-        }
+        Self { pattern, default }
     }
 }
 
 impl<'a> Variant<'a> {
     pub fn new(variant: &'a syn::Variant) -> Self {
+        let ident = &variant.ident;
+        let attrs = VariantAttributes::from(variant.attrs.as_ref());
+        let fields = &variant.fields;
+        if attrs.is_transparent()
+            && !matches!(fields, syn::Fields::Unnamed(syn::FieldsUnnamed { unnamed, ..}) if unnamed.len() == 1)
+        {
+            abort!(
+                ident.span(),
+                "The `transparent` attribute is only available for single element tuple structs"
+            );
+        }
         Self {
-            ident: &variant.ident,
-            attrs: VariantAttributes::from(variant.attrs.as_ref()),
-            fields: &variant.fields,
+            ident,
+            attrs,
+            fields,
         }
     }
 
     fn from_capture_fn_ident(&self) -> syn::Ident {
-        syn::Ident::new(&format!("from_{}_capture", self.ident.to_string().to_snek_case()), self.ident.span())
+        syn::Ident::new(
+            &format!(
+                "__from_regex_capture_{}",
+                self.ident.to_string().to_snek_case()
+            ),
+            self.ident.span(),
+        )
     }
 
-    fn from_regex_fn_ident(&self) -> syn::Ident {
-        syn::Ident::new(&format!("from_regex_as_{}", self.ident.to_string().to_snek_case()), self.ident.span())
-    }
-
-    fn capture_consuming_fn_ident(&self) -> syn::Ident {
-        syn::Ident::new(&format!("regex_capture_{}_consuming", self.ident.to_string().to_snek_case()), self.ident.span())
-    }
-
-    pub fn impl_from_capture(&self, captured_fields: crate::captures::Groups) -> (syn::Ident, proc_macro2::TokenStream) {
+    pub fn impl_from_capture(
+        &self,
+        captured_groups: &crate::captures::Groups,
+        prefixed: bool,
+    ) -> (syn::Ident, proc_macro2::TokenStream) {
         let variant = self.ident;
+        let prefix = if prefixed {
+            Some(variant.to_string())
+        } else {
+            None
+        };
         let fn_ident = self.from_capture_fn_ident();
 
+        let case_attr = if prefixed {
+            quote! {
+                #[allow(non_snake_case)]
+            }
+        } else {
+            quote! {}
+        };
+
+        // TODO: move self parts into method so we don't need to match on fields?
         let implementation = match self.fields {
+            syn::Fields::Named(syn::FieldsNamed { .. }) => {
+                let (field_names, field_statements) = crate::captures::impl_fields_from_capture(
+                    captured_groups,
+                    &self.fields,
+                    prefix.as_deref(),
+                );
 
-            syn::Fields::Named(syn::FieldsNamed { named: fields, ..}) => {
-
-                    let (field_names, field_statements) = fields.into_iter().map(|field| {
-                    let name = field.ident.clone().unwrap();
-                    let name_val = name.to_string();
-                    let name_lit = syn::LitStr::new(&name_val, name.span());
-        
-                    let statement = match captured_fields.get(name_val.as_str()) {
-                        Some(false) => quote! { let #name = captures.name(#name_lit).unwrap().as_str().into(); },
-                        Some(true) => quote! { let #name = captures.name(#name_lit).map(|mat| mat.as_str().to_string()).into(); },
-                        None => quote! { let #name = None; },
-                    };
-                    (name, statement)
-        
-                }).unzip::<_, _, Vec<_>, Vec<_>>();
-        
-                    quote! {
-                        fn #fn_ident(captures: from_regex::Captures) -> Option<Self> {
-                            #(#field_statements)*
-                            Some(Self::#variant { #(#field_names),* })
-                        }
-                    }
-                
-            }
-
-
-            syn::Fields::Unnamed(syn::FieldsUnnamed {unnamed: fields, .. }) => {
-                let (assigned_names, field_statements) = fields.into_iter().enumerate().map(|(i, field)| {
-                    let name_val = format!("_{}", i);
-                    let name_lit = syn::LitStr::new(&name_val, field.span());
-                    let name = syn::Ident::new(&name_val, field.span());
-        
-                    let statement = match captured_fields.get(name_val.as_str()) {
-                        Some(false) => quote! { let #name = captures.name(#name_lit).unwrap().as_str().into(); },
-                        Some(true) => quote! { let #name = captures.name(#name_lit).map(|mat| mat.as_str().to_string()).into(); },
-                        None => quote! { let #name = None; },
-                    };
-                    (name, statement)
-                    
-                }).unzip::<_, _, Vec<_>, Vec<_>>();
-        
-                    quote! {
-                        fn #fn_ident(captures: from_regex::Captures) -> Option<Self> {
-                            #(#field_statements)*
-                            Some(Self::#variant ( #(#assigned_names),* ))
-                        }
-                    }
-            }
-
-            syn::Fields::Unit => quote! {
-                fn #fn_ident(captures: from_regex::Captures) -> Option<Self> {
-                    Some(Self::#variant)
-                }
-            },
-        };
-
-        (fn_ident,
-            implementation
-        )
-
-    }
-
-    
-fn impl_from_regex_as_exact(
-    &self,
-    regex_const: &syn::Ident,
-) -> (syn::Ident, proc_macro2::TokenStream) {
-    let variant = self.ident;
-    let fn_ident = self.from_regex_fn_ident();
-    let from_capture_fn_ident = self.from_capture_fn_ident();
-
-    let implementation = match self.fields {
-        syn::Fields::Named(_) | syn::Fields::Unnamed(_) => quote! {
-            fn #fn_ident(s: &str) -> Option<Self> {
-                match #regex_const.captures(s) {
-                    Some(cap) if cap[0].len() == s.len() => Self::#from_capture_fn_ident(cap),
-                    Some(_) => None,
-                    None => None,
-                }
-            }
-        },
-        syn::Fields::Unit => quote! {
-            fn #fn_ident(s: &str) -> Option<Self> {
-                if #regex_const.is_match(s) {
-                    Some(Self::#variant)
-                } else {
-                    None
-                }
-            }
-        }
-    };
-
-    (fn_ident, implementation)
-}
-
-// Only for enum variant (struct searches directly)
-fn impl_capture_consuming(&self,
-    regex_const: &syn::Ident) ->(syn::Ident, proc_macro2::TokenStream) {
-        let variant = self.ident;
-        let define_ranges_and_values = match self.fields {
-            syn::Fields::Named(_) | syn::Fields::Unnamed(_) => {
-                let from_capture_fn_ident = self.from_capture_fn_ident();
                 quote! {
-                    let (ranges, values) = #regex_const
-                        .captures_iter(&s)
-                        .filter_map(|cap| {
-                            let range = cap.get(0).unwrap().range(); // Unwrap should be fine, since otherwise it wouldn't match
-                            let value = Self::#from_capture_fn_ident(cap);
-                            value.map(|v| (range, v))
-                        })
-                        .unzip::<_, _, Vec<_>, Vec<_>>();
+                    #case_attr
+                    fn #fn_ident(captures: &from_regex::Captures) -> Option<Self> {
+                        #(#field_statements)*
+                        Some(Self::#variant { #(#field_names),* })
+                    }
                 }
-            },
-            syn::Fields::Unit => quote! {
-                    let (ranges, values) = #regex_const
-                        .find_iter(&s)
-                        .map(|mat| (mat.range(), Self::#variant))
-                        .unzip::<_, _, Vec<_>, Vec<_>>();
+            }
+            syn::Fields::Unnamed(syn::FieldsUnnamed { .. }) => {
+                let (assigned_names, field_statements) = crate::captures::impl_fields_from_capture(
+                    captured_groups,
+                    &self.fields,
+                    prefix.as_deref(),
+                );
+
+                quote! {
+                    #case_attr
+                    fn #fn_ident(captures: &from_regex::Captures) -> Option<Self> {
+                        #(#field_statements)*
+                        Some(Self::#variant ( #(#assigned_names),* ))
+                    }
                 }
-        };
-    
-        let fn_ident = self.capture_consuming_fn_ident();
-        let implementation = quote! {
-
-            fn #fn_ident(s: &mut String) -> Vec<Self> {
-                let mut offset = 0;
-            
-                #define_ranges_and_values
-
-                // Remove these ranges from the string (after collecting so s isn't borrowed in the capture)
-                for mut range in ranges {
-                    range.start -= offset;
-                    range.end -= offset;
-                    offset += range.len();
-                    s.replace_range(range, "");
+            }
+            syn::Fields::Unit => {
+                quote! {
+                    fn #fn_ident(captures: &from_regex::Captures) -> Option<Self> {
+                        Some(Self::#variant)
+                    }
                 }
-
-                values
             }
         };
 
         (fn_ident, implementation)
+    }
+
+    fn transparent_inner_type(&self) -> Option<&syn::Type> {
+        if let syn::Fields::Unnamed(syn::FieldsUnnamed { unnamed, .. }) = self.fields {
+            unnamed.first().map(|f| &f.ty)
+        } else {
+            None
+        }
     }
 }

@@ -1,7 +1,7 @@
 [package]
 name = "from-regex-macros"
 description = "Macros for the from-regex crate"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2018"
 
 authors = ["Elliott Clarke <ecclarke42@gmail.com>"]
@@ -19,6 +19,7 @@ proc-macro = true
 heck = "0.3"
 lazy_static = "1.4"
 proc-macro2 = "1"
+proc-macro-error = "1"
 quote = "1"
 regex = "1.5"
 syn = { version = "1", features = ["full"] }
