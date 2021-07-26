@@ -129,13 +129,13 @@ impl<'a> quote::ToTokens for Item<'a> {
         // Similar to above, Unit struct doesn't need captures
         let impl_match_locations = if matches!(self.fields, syn::Fields::Unit) {
             quote! {
-                fn match_locations(s: &str) -> from_regex::RangeMap<usize, Self> {
+                fn match_locations(s: &str) -> from_regex::SegmentMap<usize, Self> {
                     #regex_const.find_iter(s).map(|mat| (mat.range(), Self)).collect()
                 }
             }
         } else {
             quote! {
-                fn match_locations(s: &str) -> from_regex::RangeMap<usize, Self> {
+                fn match_locations(s: &str) -> from_regex::SegmentMap<usize, Self> {
                     #regex_const
                         .captures_iter(s)
                         .filter_map(|cap| {

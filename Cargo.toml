@@ -1,7 +1,7 @@
 [package]
 name = "from-regex"
 description = "Derive deserialization of structs and enums from regex patterns"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2018"
 
 authors = ["Elliott Clarke <ecclarke42@gmail.com>"]
@@ -13,8 +13,8 @@ keywords = ["regex", "derive"]
 categories = ["parsing", "text-processing"]
 
 [dependencies]
-from-regex-macros = "0.2"
-rangemap = { git = "https://github.com/ecclarke42/rangemap" }
+from-regex-macros = "0.2.1"
+segmap = "0.1"
 regex = "1"
 lazy_static = "1"
 

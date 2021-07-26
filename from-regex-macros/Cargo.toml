@@ -1,7 +1,7 @@
 [package]
 name = "from-regex-macros"
 description = "Macros for the from-regex crate"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2018"
 
 authors = ["Elliott Clarke <ecclarke42@gmail.com>"]

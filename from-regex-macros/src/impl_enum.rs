@@ -242,7 +242,7 @@ impl<'a> Item<'a> {
                     });
 
                     // If we have transparent items to search for, use their search
-                    // functions to generate sibling `RangeMap`s and use our extension
+                    // functions to generate sibling `SegmentMap`s and use our extension
                     // trait to keep segments longer than already found
                     match_locations_transparent.push(quote! {
                         ranges.merge_only_longest(
@@ -281,9 +281,9 @@ impl<'a> Item<'a> {
                     #return_from_regex
                 }
 
-                fn match_locations(s: &str) -> from_regex::RangeMap<usize, Self> {
+                fn match_locations(s: &str) -> from_regex::SegmentMap<usize, Self> {
                     use from_regex::TextMap;
-                    let mut ranges = from_regex::RangeMap::new();
+                    let mut ranges = from_regex::SegmentMap::new();
                     for cap in #regex_ident.captures_iter(s) {
                         let range = cap.get(0).unwrap().range();
                         #(
@@ -404,9 +404,9 @@ impl<'a> Item<'a> {
                     #return_from_regex
                 }
 
-                fn match_locations(s: &str) -> from_regex::RangeMap<usize, Self> {
+                fn match_locations(s: &str) -> from_regex::SegmentMap<usize, Self> {
                     use from_regex::TextMap;
-                    let mut ranges = from_regex::RangeMap::new();
+                    let mut ranges = from_regex::SegmentMap::new();
 
                     #(
                         #match_locations_impls

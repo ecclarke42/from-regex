@@ -2,8 +2,8 @@ extern crate from_regex_macros;
 pub use from_regex_macros::*;
 pub use lazy_static::lazy_static;
 
-pub use rangemap::{self, RangeMap};
 pub use regex::{self, Captures, Regex};
+pub use segmap::{self, SegmentMap};
 pub use std::str::FromStr;
 
 // TODO: String vs &str in capture fields
@@ -24,7 +24,7 @@ pub trait FromRegex: Sized {
 
     /// Search through a string and return all instances of this type matched,
     /// As well as the ranges at which they occur.
-    fn match_locations(s: &str) -> RangeMap<usize, Self>;
+    fn match_locations(s: &str) -> SegmentMap<usize, Self>;
 }
 
 // TODO: Search trait? to split matches/match_locations out...
@@ -38,11 +38,11 @@ pub trait FromRegex: Sized {
 // }
 
 pub trait TextMap<V> {
-    fn merge_only_longest<I: IntoIterator<Item = (rangemap::Range<usize>, V)>>(&mut self, other: I);
+    fn merge_only_longest<I: IntoIterator<Item = (segmap::Segment<usize>, V)>>(&mut self, other: I);
 }
 
-impl<V: Clone + Eq> TextMap<V> for RangeMap<usize, V> {
-    fn merge_only_longest<I: IntoIterator<Item = (rangemap::Range<usize>, V)>>(
+impl<V: Clone + Eq> TextMap<V> for SegmentMap<usize, V> {
+    fn merge_only_longest<I: IntoIterator<Item = (segmap::Segment<usize>, V)>>(
         &mut self,
         other: I,
     ) {
